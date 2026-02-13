@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -107,20 +108,9 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 		if err := syscall.Mount(sysrootFolder, sysrootFolder, "", syscall.MS_REMOUNT, ""); err != nil {
 			return fmt.Errorf("failed remounting %s folder as rw: %w", sysrootFolder, err)
 		}
-		stdout, stderr, exitCode := util.Execute("unset container")
-		if exitCode != 0 {
-			log.Errorf("failed to unset container: %s: %s", stdout, stderr)
+		if tryOstreeCleanup(req.HostFsMountDir) {
+			log.Infof("Successfully freed space via ostree cleanup")
 		}
-		stdout, stderr, exitCode = util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-		if exitCode != 0 {
-			util.ExecuteShell("unset container")
-			stdout, stderr, exitCode = util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-			if exitCode != 0 {
-				log.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
-			}
-			log.Infof("Successfully removed rhcos second time")
-		}
-		log.Infof("Successfully removed rhcos")
 	}
 
 	hostArtifactsFolder := path.Join(*req.HostFsMountDir, artifactsFolder)
@@ -236,6 +226,53 @@ func createFolders(artifactsPath, bootLoaderPath string) error {
 		return fmt.Errorf("failed to create bootloader folder [%s]: %w", bootLoaderPath, err)
 	}
 	return nil
+}
+
+// tryOstreeCleanup attempts to free space by cleaning up old ostree deployments.
+// When the agent runs in a container, rpm-ostree may fail with "This system was not booted via libostree"
+// because it checks the boot environment. We then try "ostree admin cleanup --sysroot=/" on the host
+// (via nsenter), which can succeed where rpm-ostree does not. If the host root is bind-mounted at
+// hostFsMountDir we also try "ostree admin cleanup --sysroot=<hostFsMountDir>" from the container.
+// Returns true if cleanup succeeded, false otherwise.
+func tryOstreeCleanup(hostFsMountDir *string) bool {
+	// First try rpm-ostree cleanup on the host (via nsenter)
+	stdout, stderr, exitCode := util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+	if exitCode == 0 {
+		log.Infof("rpm-ostree cleanup succeeded")
+		return true
+	}
+	errMsg := stdout + stderr
+	// When running in a container, rpm-ostree refuses with "not booted via libostree"
+	if !strings.Contains(errMsg, "not booted via libostree") && !strings.Contains(errMsg, "not booted via ostree") {
+		log.Warnf("rpm-ostree cleanup failed: %s", errMsg)
+		return false
+	}
+	log.Infof("rpm-ostree cleanup not available (container or non-ostree host), trying ostree admin cleanup")
+
+	// Try on host via nsenter with explicit sysroot
+	stdout, stderr, exitCode = util.ExecutePrivileged("ostree", "admin", "cleanup", "--sysroot=/")
+	if exitCode == 0 {
+		return true
+	}
+	log.Warnf("ostree admin cleanup on host failed: %s %s", stdout, stderr)
+
+	// Try from container against bind-mounted host root (container image must have ostree CLI)
+	if hostFsMountDir != nil && *hostFsMountDir != "" {
+		sysroot := *hostFsMountDir
+		log.Infof("trying ostree admin cleanup with --sysroot=%s", sysroot)
+		stdout, stderr, exitCode = util.Execute("ostree", "admin", "cleanup", "--sysroot="+sysroot)
+		if exitCode == 0 {
+			return true
+		}
+		log.Warnf("ostree admin cleanup --sysroot=%s failed: %s %s", sysroot, stdout, stderr)
+		log.Info("trying ostree admin cleanup with --sysroot=%s/sysroot", sysroot)
+		stdout, stderr, exitCode = util.Execute("ostree", "admin", "cleanup", "--sysroot="+sysroot+"/sysroot")
+		if exitCode == 0 {
+			return true
+		}
+		log.Warnf("ostree admin cleanup --sysroot=%s/sysroot failed: %s %s", sysroot, stdout, stderr)
+	}
+	return false
 }
 
 func getSize(folder string) (int64, error) {
