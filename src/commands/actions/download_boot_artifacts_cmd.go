@@ -96,9 +96,9 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 	// In OCP 4.19+ ostree uses at least an extra 14MB which does not leave enough space for the
 	// reclaim artifacts.
 	// If there's less than 115MB of space, we call rpm-ostree to cleanup the rhcos image, which takes up a lot of space.
-	freeSpace, err := getSize(bootFolder)
+	freeSpace, err := getFreeSpace(bootFolder)
 	if err != nil {
-		return fmt.Errorf("failed to get size of %s to determine free space available for downloading boot artifacts: %w", bootFolder, err)
+		return fmt.Errorf("failed to get free space for %s: %w", bootFolder, err)
 	}
 	if freeSpace < minFreeSpaceReq {
 		// Remove some files to free up space
@@ -253,9 +253,7 @@ func tryOstreeCleanup(hostFsMountDir *string) bool {
 
 	// Try on host via nsenter with explicit sysroot
 	stdout, stderr, exitCode = util.ExecutePrivileged("ostree", "admin", "cleanup", "--sysroot=/")
-	if exitCode == 0 {
-		return true
-	}
+
 	log.Warnf("ostree admin cleanup on host failed: %s %s", stdout, stderr)
 
 	// Try from container against bind-mounted host root (container image must have ostree CLI)
@@ -263,15 +261,11 @@ func tryOstreeCleanup(hostFsMountDir *string) bool {
 		sysroot := *hostFsMountDir
 		log.Infof("trying ostree admin cleanup with --sysroot=%s", sysroot)
 		stdout, stderr, exitCode = util.ExecutePrivileged("ostree", "admin", "cleanup", "--sysroot="+sysroot)
-		if exitCode == 0 {
-			return true
-		}
+
 		log.Warnf("ostree admin cleanup --sysroot=%s failed: %s %s", sysroot, stdout, stderr)
 		log.Infof("trying ostree admin cleanup with --sysroot=%s/sysroot", sysroot)
 		stdout, stderr, exitCode = util.ExecutePrivileged("ostree", "admin", "cleanup", "--sysroot="+sysroot+"/sysroot")
-		if exitCode == 0 {
-			return true
-		}
+
 		log.Warnf("ostree admin cleanup --sysroot=%s/sysroot failed: %s %s", sysroot, stdout, stderr)
 		// Admin cleanup can fail with "unlinkat(etc): Directory not empty" when deployment etc
 		// has bind mounts. Fall back to pruning the repo to free space without removing deployment dirs.
@@ -284,17 +278,13 @@ func tryOstreeCleanup(hostFsMountDir *string) bool {
 
 // tryOstreePrune runs "ostree prune --repo=<path>" to remove unreachable objects from the ostree
 // repo. This frees space without removing deployment directories, so it avoids "Directory not empty"
-// errors that admin cleanup can hit when deployment etc is bind-mounted. Returns true if prune succeeded.
+// errors that admin cleanup can hit when deployment etc is bind-mounted. Uses host paths first
+// (when running via nsenter, /host does not exist on the host). Returns true if prune succeeded.
 func tryOstreePrune(hostFsMountDir string) bool {
-	// RHCOS repo is under sysroot at ostree/repo; host mount can be /host so repo at /host/sysroot/ostree/repo
-	for _, repoPath := range []string{
-		path.Join(hostFsMountDir, "sysroot", "ostree", "repo"),
-		path.Join(hostFsMountDir, "boot", "ostree", "repo"),
-	} {
-		if _, err := os.Stat(repoPath); err != nil {
-			continue
-		}
-		log.Infof("trying ostree prune --repo=%s to free space", repoPath)
+	// Host paths (used by ExecutePrivileged/nsenter - on the host there is no /host)
+	hostRepoPaths := []string{"/host/sysroot/ostree/repo", "/host/boot/ostree/repo"}
+	for _, repoPath := range hostRepoPaths {
+		log.Infof("trying ostree prune --repo=%s (on host) to free space", repoPath)
 		stdout, stderr, exitCode := util.ExecutePrivileged("ostree", "prune", "--refs-only", "--repo="+repoPath)
 		if exitCode == 0 {
 			log.Infof("ostree prune succeeded: %s %s", stdout, stderr)
@@ -302,15 +292,34 @@ func tryOstreePrune(hostFsMountDir string) bool {
 		}
 		log.Warnf("ostree prune --repo=%s failed: %s %s", repoPath, stdout, stderr)
 	}
+	// Container-visible paths (host root bind-mounted at hostFsMountDir, e.g. /host)
+	if hostFsMountDir != "" {
+		for _, subPath := range []string{path.Join("sysroot", "ostree", "repo"), path.Join("ostree", "repo")} {
+			repoPath := path.Join(hostFsMountDir, subPath)
+			if _, err := os.Stat(repoPath); err != nil {
+				continue
+			}
+			log.Infof("trying ostree prune --repo=%s (from container) to free space", repoPath)
+			stdout, stderr, exitCode := util.Execute("ostree", "prune", "--refs-only", "--repo="+repoPath)
+			if exitCode == 0 {
+				log.Infof("ostree prune succeeded: %s %s", stdout, stderr)
+				return true
+			}
+			log.Warnf("ostree prune --repo=%s failed: %s %s", repoPath, stdout, stderr)
+		}
+	}
 	return false
 }
 
-func getSize(folder string) (int64, error) {
-	info, err := os.Stat(folder)
-	if err != nil {
-		return 0, fmt.Errorf("failed to stat %s: %w", folder, err)
+// getFreeSpace returns the number of free bytes available on the filesystem containing path.
+// Used to check if there is enough space to download boot artifacts (e.g. in /boot).
+func getFreeSpace(path string) (int64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, fmt.Errorf("statfs %s: %w", path, err)
 	}
-	return info.Size(), nil
+	// Bavail = free blocks for non-root; Bsize = block size
+	return int64(stat.Bavail) * int64(stat.Bsize), nil
 }
 
 func removeFiles(folder string) error {
