@@ -233,7 +233,9 @@ func createFolders(artifactsPath, bootLoaderPath string) error {
 // because it checks the boot environment. We then try "ostree admin cleanup --sysroot=/" on the host
 // (via nsenter), which can succeed where rpm-ostree does not. If the host root is bind-mounted at
 // hostFsMountDir we also try "ostree admin cleanup --sysroot=<hostFsMountDir>" from the container.
-// Returns true if cleanup succeeded, false otherwise.
+// If admin cleanup fails (e.g. "unlinkat(etc): Directory not empty" when deployment etc has mounts),
+// we fall back to "ostree prune --repo=..." which frees space by removing unreachable repo objects
+// without deleting deployment directories. Returns true if any cleanup or prune succeeded.
 func tryOstreeCleanup(hostFsMountDir *string) bool {
 	// First try rpm-ostree cleanup on the host (via nsenter)
 	stdout, stderr, exitCode := util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
@@ -260,17 +262,45 @@ func tryOstreeCleanup(hostFsMountDir *string) bool {
 	if hostFsMountDir != nil && *hostFsMountDir != "" {
 		sysroot := *hostFsMountDir
 		log.Infof("trying ostree admin cleanup with --sysroot=%s", sysroot)
-		stdout, stderr, exitCode = util.Execute("ostree", "admin", "cleanup", "--sysroot="+sysroot)
+		stdout, stderr, exitCode = util.ExecutePrivileged("ostree", "admin", "cleanup", "--sysroot="+sysroot)
 		if exitCode == 0 {
 			return true
 		}
 		log.Warnf("ostree admin cleanup --sysroot=%s failed: %s %s", sysroot, stdout, stderr)
-		log.Info("trying ostree admin cleanup with --sysroot=%s/sysroot", sysroot)
-		stdout, stderr, exitCode = util.Execute("ostree", "admin", "cleanup", "--sysroot="+sysroot+"/sysroot")
+		log.Infof("trying ostree admin cleanup with --sysroot=%s/sysroot", sysroot)
+		stdout, stderr, exitCode = util.ExecutePrivileged("ostree", "admin", "cleanup", "--sysroot="+sysroot+"/sysroot")
 		if exitCode == 0 {
 			return true
 		}
 		log.Warnf("ostree admin cleanup --sysroot=%s/sysroot failed: %s %s", sysroot, stdout, stderr)
+		// Admin cleanup can fail with "unlinkat(etc): Directory not empty" when deployment etc
+		// has bind mounts. Fall back to pruning the repo to free space without removing deployment dirs.
+		if tryOstreePrune(sysroot) {
+			return true
+		}
+	}
+	return false
+}
+
+// tryOstreePrune runs "ostree prune --repo=<path>" to remove unreachable objects from the ostree
+// repo. This frees space without removing deployment directories, so it avoids "Directory not empty"
+// errors that admin cleanup can hit when deployment etc is bind-mounted. Returns true if prune succeeded.
+func tryOstreePrune(hostFsMountDir string) bool {
+	// RHCOS repo is under sysroot at ostree/repo; host mount can be /host so repo at /host/sysroot/ostree/repo
+	for _, repoPath := range []string{
+		path.Join(hostFsMountDir, "sysroot", "ostree", "repo"),
+		path.Join(hostFsMountDir, "boot", "ostree", "repo"),
+	} {
+		if _, err := os.Stat(repoPath); err != nil {
+			continue
+		}
+		log.Infof("trying ostree prune --repo=%s to free space", repoPath)
+		stdout, stderr, exitCode := util.ExecutePrivileged("ostree", "prune", "--refs-only", "--repo="+repoPath)
+		if exitCode == 0 {
+			log.Infof("ostree prune succeeded: %s %s", stdout, stderr)
+			return true
+		}
+		log.Warnf("ostree prune --repo=%s failed: %s %s", repoPath, stdout, stderr)
 	}
 	return false
 }
