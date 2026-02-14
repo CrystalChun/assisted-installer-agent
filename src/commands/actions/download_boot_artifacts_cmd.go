@@ -101,9 +101,9 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 		return fmt.Errorf("failed to get free space for %s: %w", bootFolder, err)
 	}
 	if freeSpace < minFreeSpaceReq {
-		// Remove some files to free up space
-		filePath := path.Join(bootFolder, "ostree")
-		log.Infof("Not enough space to download boot artifacts, attempting to remove rhcos %s", filePath)
+		// Free space: try ostree/rpm-ostree cleanup first, then remove /boot/ostree if still needed.
+		// This step runs only during reclaim (node will boot discovery image next, not RHCOS).
+		log.Infof("Not enough space to download boot artifacts (free %d bytes), attempting to free space", freeSpace)
 		sysrootFolder := path.Join(*req.HostFsMountDir, "/sysroot")
 		if err := syscall.Mount(sysrootFolder, sysrootFolder, "", syscall.MS_REMOUNT, ""); err != nil {
 			return fmt.Errorf("failed remounting %s folder as rw: %w", sysrootFolder, err)
@@ -111,6 +111,15 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 		if tryOstreeCleanup(req.HostFsMountDir) {
 			log.Infof("Successfully freed space via ostree cleanup")
 		}
+	}
+
+	// Remove /boot/ostree during reclaim so the ostree boot entry is gone and discovery boots next.
+	// Also frees space when we're low (handled above) or just cleans up the menu entry.
+	bootOstreePath := path.Join(bootFolder, "ostree")
+	if err := removeBootOstree(bootOstreePath); err != nil {
+		log.Warnf("Could not remove %s: %v", bootOstreePath, err)
+	} else {
+		log.Infof("Removed %s (ostree boot entry) for reclaim", bootOstreePath)
 	}
 
 	hostArtifactsFolder := path.Join(*req.HostFsMountDir, artifactsFolder)
@@ -320,6 +329,18 @@ func getFreeSpace(path string) (int64, error) {
 	}
 	// Bavail = free blocks for non-root; Bsize = block size
 	return int64(stat.Bavail) * int64(stat.Bsize), nil
+}
+
+// removeBootOstree removes /boot/ostree (and its contents) to free space during reclaim.
+// Safe only in reclaim flow where the next boot will be the discovery image, not RHCOS.
+func removeBootOstree(bootOstreePath string) error {
+	if _, err := os.Stat(bootOstreePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil // already gone
+		}
+		return err
+	}
+	return os.RemoveAll(bootOstreePath)
 }
 
 func removeFiles(folder string) error {
