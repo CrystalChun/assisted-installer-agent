@@ -75,10 +75,28 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 		return fmt.Errorf("failed remounting /host/boot folder as rw: %w", err)
 	}
 
+	// Create backing directory in /var (which has more space than /boot)
+	varBootArtifacts := path.Join(*req.HostFsMountDir, "/var/lib/assisted-installer/boot-artifacts")
+	if err := createFolderIfNotExist(varBootArtifacts); err != nil {
+		return fmt.Errorf("failed creating backing directory in /var: %w", err)
+	}
+
+	// Create mount point in /boot
 	hostArtifactsFolder := path.Join(*req.HostFsMountDir, artifactsFolder)
+	if err := createFolderIfNotExist(hostArtifactsFolder); err != nil {
+		return fmt.Errorf("failed creating /boot/discovery: %w", err)
+	}
+
+	// Bind mount /var/lib/assisted-installer/boot-artifacts to /boot/discovery
+	// This allows us to use /var's larger storage while keeping files accessible in /boot
+	if err := syscall.Mount(varBootArtifacts, hostArtifactsFolder, "", syscall.MS_BIND, ""); err != nil {
+		return fmt.Errorf("failed bind mounting %s to %s: %w", varBootArtifacts, hostArtifactsFolder, err)
+	}
+	log.Infof("Successfully bind mounted %s to %s", varBootArtifacts, hostArtifactsFolder)
+
 	bootLoaderFolder := path.Join(*req.HostFsMountDir, "/boot/loader/entries")
-	if err := createFolders(hostArtifactsFolder, bootLoaderFolder); err != nil {
-		return fmt.Errorf("failed creating folders: %w", err)
+	if err := createFolderIfNotExist(bootLoaderFolder); err != nil {
+		return fmt.Errorf("failed creating bootloader folder: %w", err)
 	}
 
 	httpClient, err := createHTTPClient(caCertPath)
@@ -86,6 +104,7 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 		return fmt.Errorf("failed creating secure assisted service client: %w", err)
 	}
 
+	// Download directly to /boot/discovery (which is bind mounted to /var)
 	if err := download(httpClient, path.Join(hostArtifactsFolder, kernelFile), *req.KernelURL, retryDownloadAmount); err != nil {
 		return fmt.Errorf("failed downloading kernel to host: %w", err)
 	}
