@@ -107,20 +107,12 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 		if err := syscall.Mount(sysrootFolder, sysrootFolder, "", syscall.MS_REMOUNT, ""); err != nil {
 			return fmt.Errorf("failed remounting %s folder as rw: %w", sysrootFolder, err)
 		}
-		stdout, stderr, exitCode := util.Execute("unset container")
+		stdout, stderr, exitCode := util.ExecutePrivileged("env", "-u", "container", "rpm-ostree", "cleanup", "--os=rhcos", "-r")
 		if exitCode != 0 {
-			log.Errorf("failed to unset container: %s: %s", stdout, stderr)
+			log.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
+		} else {
+			log.Infof("Successfully removed rhcos")
 		}
-		stdout, stderr, exitCode = util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-		if exitCode != 0 {
-			util.ExecuteShell("unset container")
-			stdout, stderr, exitCode = util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-			if exitCode != 0 {
-				log.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
-			}
-			log.Infof("Successfully removed rhcos second time")
-		}
-		log.Infof("Successfully removed rhcos")
 	}
 
 	hostArtifactsFolder := path.Join(*req.HostFsMountDir, artifactsFolder)
