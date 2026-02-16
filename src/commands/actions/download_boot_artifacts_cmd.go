@@ -125,6 +125,9 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 	}
 
 	log.Infof("Successfully downloaded boot artifacts and created bootloader config.")
+	log.Info("sleeping for 30 mins")
+	time.Sleep(30 * time.Minute)
+	log.Info("woke up from sleep")
 	return nil
 }
 
