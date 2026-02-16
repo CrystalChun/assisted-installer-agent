@@ -90,6 +90,13 @@ func ExecutePrivileged(command string, args ...string) (stdout string, stderr st
 	return Execute(command, arguments...)
 }
 
+// ExecutePrivilegedWithPID executes a command with full host namespace access including PID
+// This is required for rpm-ostree and other systemd-aware tools
+func ExecutePrivilegedWithPID(command string, args ...string) (stdout string, stderr string, exitCode int) {
+	command, arguments := buildPrivilegedCommandWithPID(command, args...)
+	return Execute(command, arguments...)
+}
+
 func buildPrivilegedCommand(command string, args ...string) (string, []string) {
 	// nsenter is used here to launch processes inside the container in a way that makes said processes feel
 	// and behave as if they're running on the host directly rather than inside the container
@@ -111,6 +118,26 @@ func buildPrivilegedCommand(command string, args ...string) (string, []string) {
 		// Network namespace is needed for accessing host networking information
 		// during inventory collection
 		"--net",
+		"--",
+		command,
+	}
+	arguments = append(arguments, args...)
+	return commandBase, arguments
+}
+
+func buildPrivilegedCommandWithPID(command string, args ...string) (string, []string) {
+	// Similar to buildPrivilegedCommand but also enters the PID namespace
+	// This is required for rpm-ostree and other tools that need full host context
+	commandBase := "nsenter"
+
+	arguments := []string{
+		"--target", "1",
+		"--cgroup",
+		"--mount",
+		"--ipc",
+		"--net",
+		// PID namespace is required for rpm-ostree to detect systemd and ostree properly
+		"--pid",
 		"--",
 		command,
 	}

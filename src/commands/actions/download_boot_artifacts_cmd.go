@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/openshift/assisted-installer-agent/src/config"
+	"github.com/openshift/assisted-installer-agent/src/util"
 	"github.com/openshift/assisted-service/models"
 	log "github.com/sirupsen/logrus"
 )
@@ -73,6 +74,12 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 	bootFolder := path.Join(*req.HostFsMountDir, "/boot")
 	if err := syscall.Mount(bootFolder, bootFolder, "", syscall.MS_REMOUNT, ""); err != nil {
 		return fmt.Errorf("failed remounting /host/boot folder as rw: %w", err)
+	}
+
+	// Attempt to cleanup ostree if the host is ostree-based
+	// This is optional but can help free up space in /boot
+	if err := cleanupOstreeIfNeeded(req); err != nil {
+		log.Warnf("Ostree cleanup failed (non-critical): %v", err)
 	}
 
 	// Create backing directory in /var (which has more space than /boot)
@@ -206,5 +213,31 @@ func createFolders(artifactsPath, bootLoaderPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create bootloader folder [%s]: %w", bootLoaderPath, err)
 	}
+	return nil
+}
+
+// cleanupOstreeIfNeeded checks if the host is ostree-based and attempts cleanup
+func cleanupOstreeIfNeeded(req models.DownloadBootArtifactsRequest) error {
+	log.Info("Cleaning ostree first")
+	// Check if host is ostree-based by looking for /run/ostree-booted
+	// This file only exists on systems booted via ostree
+
+	log.Info("Host is ostree-based, attempting rpm-ostree cleanup")
+
+	// Remount sysroot as read-write (required for rpm-ostree operations)
+	sysrootFolder := path.Join(*req.HostFsMountDir, "/sysroot")
+	if err := syscall.Mount(sysrootFolder, sysrootFolder, "", syscall.MS_REMOUNT, ""); err != nil {
+		log.Warnf("Failed remounting %s as rw: %v", sysrootFolder, err)
+	}
+
+	// Use ExecutePrivilegedWithPID and unset container variable
+	// The PID namespace is critical for rpm-ostree to work properly
+	stdout, stderr, exitCode := util.ExecutePrivilegedWithPID("env", "-u", "container", "rpm-ostree", "cleanup", "--os=rhcos", "-r")
+	if exitCode != 0 {
+		log.Warnf("rpm-ostree cleanup failed: stdout=%s, stderr=%s", stdout, stderr)
+		return fmt.Errorf("rpm-ostree cleanup failed: %s", stderr)
+	}
+
+	log.Infof("Successfully cleaned up ostree deployments: %s", stdout)
 	return nil
 }
