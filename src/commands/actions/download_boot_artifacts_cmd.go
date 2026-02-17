@@ -94,13 +94,14 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 		return fmt.Errorf("failed creating /boot/discovery: %w", err)
 	}
 
-	/* 	// Bind mount /var/lib/assisted-installer/boot-artifacts to /boot/discovery
-	   	// This allows us to use /var's larger storage while keeping files accessible in /boot
-	   	if err := syscall.Mount(varBootArtifacts, hostArtifactsFolder, "", syscall.MS_BIND, ""); err != nil {
-	   		return fmt.Errorf("failed bind mounting %s to %s: %w", varBootArtifacts, hostArtifactsFolder, err)
-	   	}
-	   	log.Infof("Successfully bind mounted %s to %s", varBootArtifacts, hostArtifactsFolder)
-	*/
+	// Create systemd mount unit to make the bind mount persistent across reboots
+	// The systemd unit will also mount it immediately for the current session
+	// Pass the actual host paths (without HostFsMountDir prefix) for the systemd unit
+	if err := createPersistentBindMount(req, "/var/lib/assisted-installer/boot-artifacts", "/boot/discovery"); err != nil {
+		return fmt.Errorf("failed to create persistent bind mount: %w", err)
+	}
+	log.Infof("Successfully created persistent bind mount from /var to /boot/discovery")
+
 	bootLoaderFolder := path.Join(*req.HostFsMountDir, "/boot/loader/entries")
 	if err := createFolderIfNotExist(bootLoaderFolder); err != nil {
 		return fmt.Errorf("failed creating bootloader folder: %w", err)
@@ -216,6 +217,50 @@ func createFolders(artifactsPath, bootLoaderPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create bootloader folder [%s]: %w", bootLoaderPath, err)
 	}
+	return nil
+}
+
+// createPersistentBindMount creates a systemd mount unit to make the bind mount persistent
+func createPersistentBindMount(req models.DownloadBootArtifactsRequest, source, target string) error {
+	// Systemd mount unit names are derived from the mount point path
+	// /boot/discovery -> boot-discovery.mount
+	mountUnitName := "boot-discovery.mount"
+	mountUnitPath := path.Join(*req.HostFsMountDir, "/etc/systemd/system", mountUnitName)
+
+	// Create systemd mount unit content
+	mountUnitContent := fmt.Sprintf(`[Unit]
+Description=Bind mount for assisted installer boot artifacts
+DefaultDependencies=no
+Before=local-fs.target
+
+[Mount]
+What=%s
+Where=/boot/discovery
+Type=none
+Options=bind
+
+[Install]
+WantedBy=local-fs.target
+`, source)
+
+	// Write mount unit to host
+	if err := os.WriteFile(mountUnitPath, []byte(mountUnitContent), 0644); err != nil {
+		return fmt.Errorf("failed to write mount unit to %s: %w", mountUnitPath, err)
+	}
+	log.Infof("Created systemd mount unit at %s", mountUnitPath)
+
+	// Enable and start the mount unit
+	stdout, stderr, exitCode := util.ExecutePrivileged("systemctl", "daemon-reload")
+	if exitCode != 0 {
+		log.Warnf("systemctl daemon-reload failed: %s %s", stdout, stderr)
+	}
+
+	stdout, stderr, exitCode = util.ExecutePrivileged("systemctl", "enable", "--now", mountUnitName)
+	if exitCode != 0 {
+		return fmt.Errorf("failed to enable mount unit: %s %s", stdout, stderr)
+	}
+
+	log.Infof("Enabled and started systemd mount unit %s", mountUnitName)
 	return nil
 }
 
