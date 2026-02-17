@@ -94,13 +94,13 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 		return fmt.Errorf("failed creating /boot/discovery: %w", err)
 	}
 
-	// Bind mount /var/lib/assisted-installer/boot-artifacts to /boot/discovery
-	// This allows us to use /var's larger storage while keeping files accessible in /boot
-	if err := syscall.Mount(varBootArtifacts, hostArtifactsFolder, "", syscall.MS_BIND, ""); err != nil {
-		return fmt.Errorf("failed bind mounting %s to %s: %w", varBootArtifacts, hostArtifactsFolder, err)
-	}
-	log.Infof("Successfully bind mounted %s to %s", varBootArtifacts, hostArtifactsFolder)
-
+	/* 	// Bind mount /var/lib/assisted-installer/boot-artifacts to /boot/discovery
+	   	// This allows us to use /var's larger storage while keeping files accessible in /boot
+	   	if err := syscall.Mount(varBootArtifacts, hostArtifactsFolder, "", syscall.MS_BIND, ""); err != nil {
+	   		return fmt.Errorf("failed bind mounting %s to %s: %w", varBootArtifacts, hostArtifactsFolder, err)
+	   	}
+	   	log.Infof("Successfully bind mounted %s to %s", varBootArtifacts, hostArtifactsFolder)
+	*/
 	bootLoaderFolder := path.Join(*req.HostFsMountDir, "/boot/loader/entries")
 	if err := createFolderIfNotExist(bootLoaderFolder); err != nil {
 		return fmt.Errorf("failed creating bootloader folder: %w", err)
@@ -225,22 +225,8 @@ func cleanupOstreeIfNeeded(req models.DownloadBootArtifactsRequest) error {
 	log.Info("Attempting to cleanup ostree via systemd-run")
 
 	// Create cleanup script on the host
-	scriptPath := path.Join(*req.HostFsMountDir, "/tmp/ostree-cleanup.sh")
+	scriptPath := path.Join(*req.HostFsMountDir, "/var/ostree-cleanup.sh")
 	scriptContent := `#!/bin/bash
-set -e
-
-# Check if system was booted via ostree
-if [ ! -f /run/ostree-booted ]; then
-    echo "System not booted via ostree, removing /boot/ostree manually if it exists"
-    if [ -d /boot/ostree ]; then
-        echo "Removing /boot/ostree..."
-        rm -rf /boot/ostree
-        echo "Successfully removed /boot/ostree"
-    else
-        echo "/boot/ostree does not exist"
-    fi
-    exit 0
-fi
 
 # System is ostree-based, try rpm-ostree cleanup
 echo "System is ostree-based, running rpm-ostree cleanup"
@@ -249,6 +235,10 @@ rpm-ostree cleanup -b --os=rhcos
 if [ $? -ne 0 ]; then
     echo "rpm-ostree cleanup failed, trying again with -r"
     rpm-ostree cleanup -b --os=rhcos -r
+	if [ $? -ne 0 ]; then
+		echo "rpm-ostree cleanup failed, giving up"
+		exit 1
+	fi
 fi
 echo "Successfully cleaned up ostree deployments"
 `
@@ -261,14 +251,7 @@ echo "Successfully cleaned up ostree deployments"
 
 	// Execute the script via systemd-run (runs in native host context)
 	// Use --wait to block until completion, --unit for unique name, --pipe to capture output
-	stdout, stderr, exitCode := util.ExecutePrivileged("systemd-run",
-		"--wait",
-		"--unit=assisted-installer-ostree-cleanup",
-		"--pipe",
-		"/tmp/ostree-cleanup.sh")
-
-	// Clean up the script
-	os.Remove(scriptPath)
+	stdout, stderr, exitCode := util.ExecutePrivileged(scriptPath)
 
 	if exitCode != 0 {
 		log.Warnf("Ostree cleanup script failed: stdout=%s, stderr=%s", stdout, stderr)
