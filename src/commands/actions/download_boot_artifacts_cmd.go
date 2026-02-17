@@ -219,29 +219,62 @@ func createFolders(artifactsPath, bootLoaderPath string) error {
 	return nil
 }
 
-// cleanupOstreeIfNeeded checks if the host is ostree-based and attempts cleanup
+// cleanupOstreeIfNeeded creates a script on the host and executes it via systemd-run
+// This ensures the cleanup runs in native host context without container environment
 func cleanupOstreeIfNeeded(req models.DownloadBootArtifactsRequest) error {
-	log.Info("Cleaning ostree first")
-	// Check if host is ostree-based by looking for /run/ostree-booted
-	// This file only exists on systems booted via ostree
+	log.Info("Attempting to cleanup ostree via systemd-run")
 
-	log.Info("Host is ostree-based, attempting rpm-ostree cleanup")
+	// Create cleanup script on the host
+	scriptPath := path.Join(*req.HostFsMountDir, "/tmp/ostree-cleanup.sh")
+	scriptContent := `#!/bin/bash
+set -e
 
-	// Remount sysroot as read-write (required for rpm-ostree operations)
-	sysrootFolder := path.Join(*req.HostFsMountDir, "/sysroot")
-	if err := syscall.Mount(sysrootFolder, sysrootFolder, "", syscall.MS_REMOUNT, ""); err != nil {
-		log.Warnf("Failed remounting %s as rw: %v", sysrootFolder, err)
+# Check if system was booted via ostree
+if [ ! -f /run/ostree-booted ]; then
+    echo "System not booted via ostree, removing /boot/ostree manually if it exists"
+    if [ -d /boot/ostree ]; then
+        echo "Removing /boot/ostree..."
+        rm -rf /boot/ostree
+        echo "Successfully removed /boot/ostree"
+    else
+        echo "/boot/ostree does not exist"
+    fi
+    exit 0
+fi
+
+# System is ostree-based, try rpm-ostree cleanup
+echo "System is ostree-based, running rpm-ostree cleanup"
+mount -o remount,rw /sysroot || true
+rpm-ostree cleanup -b --os=rhcos
+if [ $? -ne 0 ]; then
+    echo "rpm-ostree cleanup failed, trying again with -r"
+    rpm-ostree cleanup -b --os=rhcos -r
+fi
+echo "Successfully cleaned up ostree deployments"
+`
+
+	// Write script to host filesystem
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		return fmt.Errorf("failed to write cleanup script to %s: %w", scriptPath, err)
 	}
+	log.Infof("Wrote cleanup script to %s", scriptPath)
 
-	// Use ExecutePrivilegedWithPIDNoContainer which enters PID namespace
-	// and explicitly removes the container environment variable
-	// The PID namespace is critical for rpm-ostree to work properly
-	stdout, stderr, exitCode := util.ExecutePrivilegedWithPIDNoContainer("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+	// Execute the script via systemd-run (runs in native host context)
+	// Use --wait to block until completion, --unit for unique name, --pipe to capture output
+	stdout, stderr, exitCode := util.ExecutePrivileged("systemd-run",
+		"--wait",
+		"--unit=assisted-installer-ostree-cleanup",
+		"--pipe",
+		"/tmp/ostree-cleanup.sh")
+
+	// Clean up the script
+	os.Remove(scriptPath)
+
 	if exitCode != 0 {
-		log.Warnf("rpm-ostree cleanup failed: stdout=%s, stderr=%s", stdout, stderr)
-		return fmt.Errorf("rpm-ostree cleanup failed: %s", stderr)
+		log.Warnf("Ostree cleanup script failed: stdout=%s, stderr=%s", stdout, stderr)
+		return fmt.Errorf("ostree cleanup script failed: %s", stderr)
 	}
 
-	log.Infof("Successfully cleaned up ostree deployments: %s", stdout)
+	log.Infof("Ostree cleanup completed successfully: %s", stdout)
 	return nil
 }
