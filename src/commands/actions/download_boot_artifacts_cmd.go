@@ -246,69 +246,6 @@ func copyFile(src, dst string) error {
 // cleanupOstreeIfNeeded creates a script on the host and executes it via systemd-run
 // This ensures the cleanup runs in native host context without container environment
 func cleanupOstreeIfNeeded(req models.DownloadBootArtifactsRequest) error {
-	// Systemd mount unit names are derived from the mount point path
-	// /boot/discovery -> boot-discovery.mount
-	mountUnitName := "boot-discovery.mount"
-	mountUnitPath := path.Join(*req.HostFsMountDir, "/etc/systemd/system", mountUnitName)
-
-	// Create systemd mount unit content
-	mountUnitContent := fmt.Sprintf(`[Unit]
-Description=Bind mount for assisted installer boot artifacts
-DefaultDependencies=no
-Before=local-fs.target
-
-[Mount]
-What=%s
-Where=/boot/discovery
-Type=none
-Options=bind
-
-[Install]
-WantedBy=local-fs.target
-`, source)
-
-	// Write mount unit to host
-	if err := os.WriteFile(mountUnitPath, []byte(mountUnitContent), 0644); err != nil {
-		return fmt.Errorf("failed to write mount unit to %s: %w", mountUnitPath, err)
-	}
-	log.Infof("Created systemd mount unit at %s", mountUnitPath)
-
-	// Verify the file was written from host's perspective
-	stdout, stderr, exitCode := util.ExecutePrivileged("test", "-f", "/etc/systemd/system/boot-discovery.mount")
-	if exitCode != 0 {
-		return fmt.Errorf("mount unit file verification failed: %s %s", stdout, stderr)
-	}
-	log.Info("Verified mount unit file exists on host")
-
-	// Reload systemd to pick up the new unit
-	stdout, stderr, exitCode = util.ExecutePrivileged("systemctl", "daemon-reload")
-	if exitCode != 0 {
-		return fmt.Errorf("systemctl daemon-reload failed: %s %s", stdout, stderr)
-	}
-	log.Info("Systemd daemon reloaded successfully")
-
-	// Enable and start the mount unit
-	stdout, stderr, exitCode = util.ExecutePrivileged("systemctl", "enable", "--now", mountUnitName)
-	if exitCode != 0 {
-		return fmt.Errorf("failed to enable mount unit: %s %s", stdout, stderr)
-	}
-
-	log.Infof("Enabled and started systemd mount unit %s", mountUnitName)
-
-	// Verify the mount is active
-	stdout, stderr, exitCode = util.ExecutePrivileged("systemctl", "is-active", mountUnitName)
-	if exitCode != 0 {
-		log.Warnf("Mount unit may not be active: %s %s", stdout, stderr)
-	} else {
-		log.Infof("Mount unit is active: %s", stdout)
-	}
-
-	return nil
-}
-
-// cleanupOstreeIfNeeded creates a script on the host and executes it via systemd-run
-// This ensures the cleanup runs in native host context without container environment
-func cleanupOstreeIfNeeded(req models.DownloadBootArtifactsRequest) error {
 	log.Info("Attempting to cleanup ostree via systemd-run")
 
 	// Create cleanup script on the host
