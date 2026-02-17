@@ -82,44 +82,53 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 		log.Warnf("Ostree cleanup failed (non-critical): %v", err)
 	}
 
-	// Create backing directory in /var (which has more space than /boot)
-	varBootArtifacts := path.Join(*req.HostFsMountDir, "/var/lib/assisted-installer/boot-artifacts")
-	if err := createFolderIfNotExist(varBootArtifacts); err != nil {
-		return fmt.Errorf("failed creating backing directory in /var: %w", err)
+	// Create temporary directory in /var (which has more space than /boot)
+	// We'll download here first, then copy to /boot after cleanup
+	varTempDir := path.Join(*req.HostFsMountDir, "/var/tmp/assisted-installer-boot-artifacts")
+	if err := createFolderIfNotExist(varTempDir); err != nil {
+		return fmt.Errorf("failed creating temp directory in /var: %w", err)
 	}
-
-	// Create mount point in /boot
-	hostArtifactsFolder := path.Join(*req.HostFsMountDir, artifactsFolder)
-	if err := createFolderIfNotExist(hostArtifactsFolder); err != nil {
-		return fmt.Errorf("failed creating /boot/discovery: %w", err)
-	}
-
-	// Create systemd mount unit to make the bind mount persistent across reboots
-	// The systemd unit will also mount it immediately for the current session
-	// Pass the actual host paths (without HostFsMountDir prefix) for the systemd unit
-	if err := createPersistentBindMount(req, "/var/lib/assisted-installer/boot-artifacts", "/boot/discovery"); err != nil {
-		return fmt.Errorf("failed to create persistent bind mount: %w", err)
-	}
-	log.Infof("Successfully created persistent bind mount from /var to /boot/discovery")
-
-	bootLoaderFolder := path.Join(*req.HostFsMountDir, "/boot/loader/entries")
-	if err := createFolderIfNotExist(bootLoaderFolder); err != nil {
-		return fmt.Errorf("failed creating bootloader folder: %w", err)
-	}
+	defer os.RemoveAll(varTempDir) // Clean up temp files
 
 	httpClient, err := createHTTPClient(caCertPath)
 	if err != nil {
 		return fmt.Errorf("failed creating secure assisted service client: %w", err)
 	}
 
-	// Download directly to /boot/discovery (which is bind mounted to /var)
-	if err := download(httpClient, path.Join(hostArtifactsFolder, kernelFile), *req.KernelURL, retryDownloadAmount); err != nil {
-		return fmt.Errorf("failed downloading kernel to host: %w", err)
+	// Download to /var/tmp first (lots of space available)
+	tmpKernelPath := path.Join(varTempDir, kernelFile)
+	tmpInitrdPath := path.Join(varTempDir, initrdFile)
+
+	log.Info("Downloading boot artifacts to temporary location in /var")
+	if err := download(httpClient, tmpKernelPath, *req.KernelURL, retryDownloadAmount); err != nil {
+		return fmt.Errorf("failed downloading kernel to temp location: %w", err)
 	}
 
-	if err := download(httpClient, path.Join(hostArtifactsFolder, initrdFile), *req.InitrdURL, retryDownloadAmount); err != nil {
-		return fmt.Errorf("failed downloading initrd to host: %w", err)
+	if err := download(httpClient, tmpInitrdPath, *req.InitrdURL, retryDownloadAmount); err != nil {
+		return fmt.Errorf("failed downloading initrd to temp location: %w", err)
 	}
+	log.Info("Successfully downloaded boot artifacts to temp location")
+
+	// Now create final destination folders in /boot
+	hostArtifactsFolder := path.Join(*req.HostFsMountDir, artifactsFolder)
+	bootLoaderFolder := path.Join(*req.HostFsMountDir, "/boot/loader/entries")
+	if err := createFolders(hostArtifactsFolder, bootLoaderFolder); err != nil {
+		return fmt.Errorf("failed creating folders: %w", err)
+	}
+
+	// Copy files from /var/tmp to /boot/discovery
+	finalKernelPath := path.Join(hostArtifactsFolder, kernelFile)
+	finalInitrdPath := path.Join(hostArtifactsFolder, initrdFile)
+
+	log.Info("Copying boot artifacts from /var to /boot/discovery")
+	if err := copyFile(tmpKernelPath, finalKernelPath); err != nil {
+		return fmt.Errorf("failed copying kernel to /boot: %w", err)
+	}
+
+	if err := copyFile(tmpInitrdPath, finalInitrdPath); err != nil {
+		return fmt.Errorf("failed copying initrd to /boot: %w", err)
+	}
+	log.Info("Successfully copied boot artifacts to /boot/discovery")
 
 	if err := createBootLoaderConfig(*req.RootfsURL, artifactsFolder, bootLoaderFolder); err != nil {
 		return fmt.Errorf("failed creating bootloader config file on host: %w", err)
@@ -220,8 +229,23 @@ func createFolders(artifactsPath, bootLoaderPath string) error {
 	return nil
 }
 
-// createPersistentBindMount creates a systemd mount unit to make the bind mount persistent
-func createPersistentBindMount(req models.DownloadBootArtifactsRequest, source, target string) error {
+func copyFile(src, dst string) error {
+	sourceData, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("failed to read source file %s: %w", src, err)
+	}
+
+	if err := os.WriteFile(dst, sourceData, 0644); err != nil {
+		return fmt.Errorf("failed to write destination file %s: %w", dst, err)
+	}
+
+	log.Infof("Copied %s to %s", src, dst)
+	return nil
+}
+
+// cleanupOstreeIfNeeded creates a script on the host and executes it via systemd-run
+// This ensures the cleanup runs in native host context without container environment
+func cleanupOstreeIfNeeded(req models.DownloadBootArtifactsRequest) error {
 	// Systemd mount unit names are derived from the mount point path
 	// /boot/discovery -> boot-discovery.mount
 	mountUnitName := "boot-discovery.mount"
@@ -249,18 +273,36 @@ WantedBy=local-fs.target
 	}
 	log.Infof("Created systemd mount unit at %s", mountUnitPath)
 
-	// Enable and start the mount unit
-	stdout, stderr, exitCode := util.ExecutePrivileged("systemctl", "daemon-reload")
+	// Verify the file was written from host's perspective
+	stdout, stderr, exitCode := util.ExecutePrivileged("test", "-f", "/etc/systemd/system/boot-discovery.mount")
 	if exitCode != 0 {
-		log.Warnf("systemctl daemon-reload failed: %s %s", stdout, stderr)
+		return fmt.Errorf("mount unit file verification failed: %s %s", stdout, stderr)
 	}
+	log.Info("Verified mount unit file exists on host")
 
+	// Reload systemd to pick up the new unit
+	stdout, stderr, exitCode = util.ExecutePrivileged("systemctl", "daemon-reload")
+	if exitCode != 0 {
+		return fmt.Errorf("systemctl daemon-reload failed: %s %s", stdout, stderr)
+	}
+	log.Info("Systemd daemon reloaded successfully")
+
+	// Enable and start the mount unit
 	stdout, stderr, exitCode = util.ExecutePrivileged("systemctl", "enable", "--now", mountUnitName)
 	if exitCode != 0 {
 		return fmt.Errorf("failed to enable mount unit: %s %s", stdout, stderr)
 	}
 
 	log.Infof("Enabled and started systemd mount unit %s", mountUnitName)
+
+	// Verify the mount is active
+	stdout, stderr, exitCode = util.ExecutePrivileged("systemctl", "is-active", mountUnitName)
+	if exitCode != 0 {
+		log.Warnf("Mount unit may not be active: %s %s", stdout, stderr)
+	} else {
+		log.Infof("Mount unit is active: %s", stdout)
+	}
+
 	return nil
 }
 
@@ -294,9 +336,12 @@ echo "Successfully cleaned up ostree deployments"
 	}
 	log.Infof("Wrote cleanup script to %s", scriptPath)
 
-	// Execute the script via systemd-run (runs in native host context)
-	// Use --wait to block until completion, --unit for unique name, --pipe to capture output
-	stdout, stderr, exitCode := util.ExecutePrivileged(scriptPath)
+	// Execute the script with ExecutePrivilegedWithPIDNoContainer
+	// This removes the container environment variable before execution
+	stdout, stderr, exitCode := util.ExecutePrivilegedWithPIDNoContainer("bash", scriptPath)
+
+	// Clean up the script file
+	os.Remove(scriptPath)
 
 	if exitCode != 0 {
 		log.Warnf("Ostree cleanup script failed: stdout=%s, stderr=%s", stdout, stderr)
