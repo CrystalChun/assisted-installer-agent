@@ -45,6 +45,17 @@ func Execute(command string, args ...string) (stdout string, stderr string, exit
 	return stdoutBytes.String(), getErrorStr(err, &stderrBytes), getExitCode(err)
 }
 
+func ExecuteWithEnv(command string, args []string, env []string) (stdout string, stderr string, exitCode int) {
+	log.Infof("Executing %s %v with custom env", command, args)
+	cmd := exec.Command(command, args...)
+	cmd.Env = env
+	var stdoutBytes, stderrBytes bytes2.Buffer
+	cmd.Stdout = &stdoutBytes
+	cmd.Stderr = &stderrBytes
+	err := cmd.Run()
+	return stdoutBytes.String(), getErrorStr(err, &stderrBytes), getExitCode(err)
+}
+
 func LogPrivilegedCommandOutput(logfile *os.File, result error, commandDescription string, command string, args ...string) error {
 	log.Infof("%s", commandDescription)
 	loglnToFile(logfile, commandDescription)
@@ -95,6 +106,24 @@ func ExecutePrivileged(command string, args ...string) (stdout string, stderr st
 func ExecutePrivilegedWithPID(command string, args ...string) (stdout string, stderr string, exitCode int) {
 	command, arguments := buildPrivilegedCommandWithPID(command, args...)
 	return Execute(command, arguments...)
+}
+
+// ExecutePrivilegedWithPIDNoContainer executes a command with full host namespace access
+// and explicitly removes the container environment variable
+// This is required for rpm-ostree which refuses to run when container= is set
+func ExecutePrivilegedWithPIDNoContainer(command string, args ...string) (stdout string, stderr string, exitCode int) {
+	command, arguments := buildPrivilegedCommandWithPID(command, args...)
+
+	// Build a clean environment without the container variable
+	env := []string{}
+	for _, e := range os.Environ() {
+		// Skip any environment variable that starts with "container"
+		if !strings.HasPrefix(e, "container=") && !strings.HasPrefix(e, "CONTAINER=") {
+			env = append(env, e)
+		}
+	}
+
+	return ExecuteWithEnv(command, arguments, env)
 }
 
 func buildPrivilegedCommand(command string, args ...string) (string, []string) {

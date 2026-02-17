@@ -233,9 +233,10 @@ func cleanupOstreeIfNeeded(req models.DownloadBootArtifactsRequest) error {
 		log.Warnf("Failed remounting %s as rw: %v", sysrootFolder, err)
 	}
 
-	// Use ExecutePrivilegedWithPID and unset container variable
+	// Use ExecutePrivilegedWithPIDNoContainer which enters PID namespace
+	// and explicitly removes the container environment variable
 	// The PID namespace is critical for rpm-ostree to work properly
-	stdout, stderr, exitCode := util.ExecutePrivilegedWithPID("env", "-u", "container", "rpm-ostree", "cleanup", "--os=rhcos", "-r")
+	stdout, stderr, exitCode := util.ExecutePrivilegedWithPIDNoContainer("rpm-ostree", "cleanup", "--os=rhcos", "-r")
 	if exitCode != 0 {
 		log.Warnf("rpm-ostree cleanup failed: stdout=%s, stderr=%s", stdout, stderr)
 		return fmt.Errorf("rpm-ostree cleanup failed: %s", stderr)
