@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -66,6 +67,11 @@ initrd %s`
 )
 
 func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
+	defer func() {
+		log.Info("sleeping for 30 mins")
+		time.Sleep(30 * time.Minute)
+		log.Info("woke up from sleep")
+	}()
 	var req models.DownloadBootArtifactsRequest
 	if err := json.Unmarshal([]byte(downloaderRequestStr), &req); err != nil {
 		return fmt.Errorf("failed unmarshalling download boot artifacts request: %w", err)
@@ -75,6 +81,11 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 	if err := syscall.Mount(bootFolder, bootFolder, "", syscall.MS_REMOUNT, ""); err != nil {
 		return fmt.Errorf("failed remounting /host/boot folder as rw: %w", err)
 	}
+	info, err := os.Stat(bootFolder)
+	if err != nil {
+		log.Warnf("failed to stat /host/boot folder: %v", err)
+	}
+	log.Infof("boot folder size: %d", info.Size())
 
 	// Attempt to cleanup ostree if the host is ostree-based
 	// This is optional but can help free up space in /boot
@@ -82,62 +93,73 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 		log.Warnf("Ostree cleanup failed (non-critical): %v", err)
 	}
 
-	// Create temporary directory in /var (which has more space than /boot)
-	// We'll download here first, then copy to /boot after cleanup
-	varTempDir := path.Join(*req.HostFsMountDir, "/var/tmp/assisted-installer-boot-artifacts")
-	if err := createFolderIfNotExist(varTempDir); err != nil {
-		return fmt.Errorf("failed creating temp directory in /var: %w", err)
+	info, err = os.Stat(bootFolder)
+	if err != nil {
+		log.Warnf("failed to stat /host/boot folder: %v", err)
 	}
-	defer os.RemoveAll(varTempDir) // Clean up temp files
+	log.Infof("boot folder size: %d", info.Size())
+
+	log.Info("try to run rpm ostree cleanup")
+	stdout, stderr, exitCode := util.ExecutePrivilegedWithPIDNoContainer("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+	if exitCode != 0 {
+		log.Warnf("rpm-ostree cleanup failed: %s", stderr)
+	}
+	log.Infof("rpm-ostree cleanup completed successfully: %s", stdout)
+	info, err = os.Stat(bootFolder)
+	if err != nil {
+		log.Warnf("failed to stat /host/boot folder: %v", err)
+	}
+	log.Infof("boot folder size: %d", info.Size())
+
+	/* 	// Create backing directory in /var (which has more space than /boot)
+	   	varBootArtifacts := path.Join(*req.HostFsMountDir, "/var/lib/assisted-installer/boot-artifacts")
+	   	if err := createFolderIfNotExist(varBootArtifacts); err != nil {
+	   		log.Warnf("failed creating backing directory in /var: %v", err)
+	   	}
+	*/
+	// Create mount point in /boot
+	hostArtifactsFolder := path.Join(*req.HostFsMountDir, artifactsFolder)
+	if err := createFolderIfNotExist(hostArtifactsFolder); err != nil {
+		log.Warnf("failed creating /boot/discovery: %v", err)
+	}
+
+	/* 	// Bind mount /var/lib/assisted-installer/boot-artifacts to /boot/discovery
+	   	// This allows us to use /var's larger storage while keeping files accessible in /boot
+	   	if err := syscall.Mount(varBootArtifacts, hostArtifactsFolder, "", syscall.MS_BIND, ""); err != nil {
+	   		log.Warnf("failed bind mounting %s to %s: %v", varBootArtifacts, hostArtifactsFolder, err)
+	   	} else {
+	   		log.Infof("Successfully bind mounted %s to %s", varBootArtifacts, hostArtifactsFolder)
+
+	   		// Make the bind mount persistent across reboots by adding to /etc/fstab
+	   		if err := addToFstab(req); err != nil {
+	   			log.Warnf("Failed to add bind mount to fstab (non-critical): %v", err)
+	   		}
+	   	} */
+	bootLoaderFolder := path.Join(*req.HostFsMountDir, "/boot/loader/entries")
+	if err := createFolderIfNotExist(bootLoaderFolder); err != nil {
+		log.Warnf("failed creating bootloader folder: %v", err)
+	}
 
 	httpClient, err := createHTTPClient(caCertPath)
 	if err != nil {
 		return fmt.Errorf("failed creating secure assisted service client: %w", err)
 	}
 
-	// Download to /var/tmp first (lots of space available)
-	tmpKernelPath := path.Join(varTempDir, kernelFile)
-	tmpInitrdPath := path.Join(varTempDir, initrdFile)
-
-	log.Info("Downloading boot artifacts to temporary location in /var")
-	if err := download(httpClient, tmpKernelPath, *req.KernelURL, retryDownloadAmount); err != nil {
-		return fmt.Errorf("failed downloading kernel to temp location: %w", err)
+	// Download directly to /boot/discovery (which is bind mounted to /var)
+	if err := download(httpClient, path.Join(hostArtifactsFolder, kernelFile), *req.KernelURL, retryDownloadAmount); err != nil {
+		return fmt.Errorf("failed downloading kernel to host: %w", err)
 	}
 
-	if err := download(httpClient, tmpInitrdPath, *req.InitrdURL, retryDownloadAmount); err != nil {
-		return fmt.Errorf("failed downloading initrd to temp location: %w", err)
+	if err := download(httpClient, path.Join(hostArtifactsFolder, initrdFile), *req.InitrdURL, retryDownloadAmount); err != nil {
+		return fmt.Errorf("failed downloading initrd to host: %w", err)
 	}
-	log.Info("Successfully downloaded boot artifacts to temp location")
-
-	// Now create final destination folders in /boot
-	hostArtifactsFolder := path.Join(*req.HostFsMountDir, artifactsFolder)
-	bootLoaderFolder := path.Join(*req.HostFsMountDir, "/boot/loader/entries")
-	if err := createFolders(hostArtifactsFolder, bootLoaderFolder); err != nil {
-		return fmt.Errorf("failed creating folders: %w", err)
-	}
-
-	// Copy files from /var/tmp to /boot/discovery
-	finalKernelPath := path.Join(hostArtifactsFolder, kernelFile)
-	finalInitrdPath := path.Join(hostArtifactsFolder, initrdFile)
-
-	log.Info("Copying boot artifacts from /var to /boot/discovery")
-	if err := copyFile(tmpKernelPath, finalKernelPath); err != nil {
-		return fmt.Errorf("failed copying kernel to /boot: %w", err)
-	}
-
-	if err := copyFile(tmpInitrdPath, finalInitrdPath); err != nil {
-		return fmt.Errorf("failed copying initrd to /boot: %w", err)
-	}
-	log.Info("Successfully copied boot artifacts to /boot/discovery")
 
 	if err := createBootLoaderConfig(*req.RootfsURL, artifactsFolder, bootLoaderFolder); err != nil {
 		return fmt.Errorf("failed creating bootloader config file on host: %w", err)
 	}
 
 	log.Infof("Successfully downloaded boot artifacts and created bootloader config.")
-	log.Info("sleeping for 30 mins")
-	time.Sleep(30 * time.Minute)
-	log.Info("woke up from sleep")
+
 	return nil
 }
 
@@ -229,21 +251,41 @@ func createFolders(artifactsPath, bootLoaderPath string) error {
 	return nil
 }
 
-func copyFile(src, dst string) error {
-	sourceData, err := os.ReadFile(src)
+// addToFstab adds the bind mount entry to /etc/fstab for persistence across reboots
+func addToFstab(req models.DownloadBootArtifactsRequest) error {
+	fstabPath := path.Join(*req.HostFsMountDir, "/etc/fstab")
+
+	// Read current fstab content
+	fstabContent, err := os.ReadFile(fstabPath)
 	if err != nil {
-		return fmt.Errorf("failed to read source file %s: %w", src, err)
+		return fmt.Errorf("failed to read fstab: %w", err)
 	}
 
-	if err := os.WriteFile(dst, sourceData, 0644); err != nil {
-		return fmt.Errorf("failed to write destination file %s: %w", dst, err)
+	// Check if entry already exists
+	if strings.Contains(string(fstabContent), "/boot/discovery") {
+		log.Info("Bind mount entry already exists in /etc/fstab")
+		return nil
 	}
 
-	log.Infof("Copied %s to %s", src, dst)
+	// Create fstab entry
+	fstabEntry := "/var/lib/assisted-installer/boot-artifacts /boot/discovery none bind 0 0\n"
+
+	// Append to fstab
+	f, err := os.OpenFile(fstabPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open fstab for writing: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(fstabEntry); err != nil {
+		return fmt.Errorf("failed to write to fstab: %w", err)
+	}
+
+	log.Info("Successfully added bind mount entry to /etc/fstab")
 	return nil
 }
 
-// cleanupOstreeIfNeeded creates a script on the host and executes it via systemd-run
+// cleanupOstreeIfNeeded creates a script on the host and executes it
 // This ensures the cleanup runs in native host context without container environment
 func cleanupOstreeIfNeeded(req models.DownloadBootArtifactsRequest) error {
 	log.Info("Attempting to cleanup ostree via systemd-run")
@@ -251,9 +293,7 @@ func cleanupOstreeIfNeeded(req models.DownloadBootArtifactsRequest) error {
 	// Create cleanup script on the host
 	scriptPath := path.Join(*req.HostFsMountDir, "/var/ostree-cleanup.sh")
 	scriptContent := `#!/bin/bash
-
-# System is ostree-based, try rpm-ostree cleanup
-echo "System is ostree-based, running rpm-ostree cleanup"
+unset container
 mount -o remount,rw /sysroot || true
 rpm-ostree cleanup -b --os=rhcos
 if [ $? -ne 0 ]; then
@@ -276,9 +316,6 @@ echo "Successfully cleaned up ostree deployments"
 	// Execute the script with ExecutePrivilegedWithPIDNoContainer
 	// This removes the container environment variable before execution
 	stdout, stderr, exitCode := util.ExecutePrivilegedWithPIDNoContainer("bash", scriptPath)
-
-	// Clean up the script file
-	os.Remove(scriptPath)
 
 	if exitCode != 0 {
 		log.Warnf("Ostree cleanup script failed: stdout=%s, stderr=%s", stdout, stderr)
