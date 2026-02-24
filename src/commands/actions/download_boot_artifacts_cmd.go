@@ -142,20 +142,20 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 
 	httpClient, err := createHTTPClient(caCertPath)
 	if err != nil {
-		return fmt.Errorf("failed creating secure assisted service client: %w", err)
+		log.Warnf("failed creating secure assisted service client: %v", err)
 	}
 
 	// Download directly to /boot/discovery (which is bind mounted to /var)
 	if err := download(httpClient, path.Join(hostArtifactsFolder, kernelFile), *req.KernelURL, retryDownloadAmount); err != nil {
-		return fmt.Errorf("failed downloading kernel to host: %w", err)
+		log.Warnf("failed downloading kernel to host: %v", err)
 	}
 
 	if err := download(httpClient, path.Join(hostArtifactsFolder, initrdFile), *req.InitrdURL, retryDownloadAmount); err != nil {
-		return fmt.Errorf("failed downloading initrd to host: %w", err)
+		log.Warnf("failed downloading initrd to host: %v", err)
 	}
 
 	if err := createBootLoaderConfig(*req.RootfsURL, artifactsFolder, bootLoaderFolder); err != nil {
-		return fmt.Errorf("failed creating bootloader config file on host: %w", err)
+		log.Warnf("failed creating bootloader config file on host: %v", err)
 	}
 
 	log.Infof("Successfully downloaded boot artifacts and created bootloader config.")
@@ -293,18 +293,39 @@ func cleanupOstreeIfNeeded(req models.DownloadBootArtifactsRequest) error {
 	// Create cleanup script on the host
 	scriptPath := path.Join(*req.HostFsMountDir, "/var/ostree-cleanup.sh")
 	scriptContent := `#!/bin/bash
-unset container
-mount -o remount,rw /sysroot || true
-rpm-ostree cleanup -b --os=rhcos
-if [ $? -ne 0 ]; then
+set -e
+mount -o remount,rw /host/sysroot || true
+
+# Setup proper chroot environment with bind mounts
+mount --bind /host/proc /host/proc 2>/dev/null || true
+mount --bind /host/sys /host/sys 2>/dev/null || true
+mount --bind /host/dev /host/dev 2>/dev/null || true
+mount --bind /host/run /host/run 2>/dev/null || true
+
+# Run rpm-ostree cleanup in the chroot
+set +e
+echo "Running: chroot /host rpm-ostree cleanup -b --os=rhcos --peer"
+chroot /host rpm-ostree cleanup -b --os=rhcos --peer
+EXIT_CODE=$?
+echo "Exit code: $EXIT_CODE"
+
+if [ $EXIT_CODE -ne 0 ]; then
     echo "rpm-ostree cleanup failed, trying again with -r"
-    rpm-ostree cleanup -b --os=rhcos -r
-	if [ $? -ne 0 ]; then
+    chroot /host rpm-ostree cleanup -b --os=rhcos -r --peer
+	EXIT_CODE=$?
+	echo "Exit code with -r: $EXIT_CODE"
+	if [ $EXIT_CODE -ne 0 ]; then
 		echo "rpm-ostree cleanup failed, giving up"
 		exit 1
 	fi
 fi
 echo "Successfully cleaned up ostree deployments"
+
+# Cleanup bind mounts
+umount /host/run 2>/dev/null || true
+umount /host/dev 2>/dev/null || true
+umount /host/sys 2>/dev/null || true
+umount /host/proc 2>/dev/null || true
 `
 
 	// Write script to host filesystem
