@@ -92,24 +92,54 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 }
 
 func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPath string, bootFolder string) error {
+	httpClient, err := createHTTPClient(caCertPath)
+	if err != nil {
+		return fmt.Errorf("failed creating secure assisted service client: %w", err)
+	}
+
+	tempBootArtifactsFolder := path.Join("/tmp", "boot_artifacts")
+	if err := createFolderIfNotExist(tempBootArtifactsFolder); err != nil {
+		return fmt.Errorf("failed creating temp download folder: %w", err)
+	}
+	tempDownloadFolder := path.Join(tempBootArtifactsFolder, "download")
+	if err := createFolderIfNotExist(tempDownloadFolder); err != nil {
+		return fmt.Errorf("failed creating temp download folder: %w", err)
+	}
+	if err := download(httpClient, path.Join(tempDownloadFolder, kernelFile), *req.KernelURL, retryDownloadAmount); err != nil {
+		return fmt.Errorf("failed downloading kernel to host: %w", err)
+	}
+
+	if err := download(httpClient, path.Join(tempDownloadFolder, initrdFile), *req.InitrdURL, retryDownloadAmount); err != nil {
+		return fmt.Errorf("failed downloading initrd to host: %w", err)
+	}
+
+	if err := createBootLoaderConfig(*req.RootfsURL, artifactsFolder, tempBootArtifactsFolder); err != nil {
+		return fmt.Errorf("failed creating bootloader config file on host: %w", err)
+	}
+	artifactsSize, _, err := getSize(tempBootArtifactsFolder)
+	if err != nil {
+		return fmt.Errorf("failed to get size of %s: %w", tempBootArtifactsFolder, err)
+	}
+	log.Infof("size of temp boot artifacts folder: %d", artifactsSize)
+
 	// Determine size of /boot folder
 	// Currently there's a space limit of 350MB that's hard-coded in coreos
 	// https://github.com/coreos/coreos-assembler/issues/4384
 	// In OCP 4.19+ ostree uses at least an extra 14MB which does not leave enough space for the
 	// reclaim artifacts.
 	// If there's less than 115MB of space, we call rpm-ostree to cleanup the rhcos image, which takes up a lot of space.
-	freeSpace, err := getSize(bootFolder)
+	_, freeSpace, err := getSize(bootFolder)
 	if err != nil {
 		return fmt.Errorf("failed to get size of %s to determine free space available for downloading boot artifacts: %w", bootFolder, err)
 	}
 	log.Infof("freeSpace: %d", freeSpace)
-	if freeSpace < minFreeSpaceReq {
-		log.Infof("freeSpace: %d", freeSpace)
+	if freeSpace < artifactsSize {
+		log.Infof("freeSpace: %d is less than artifactsSize: %d", freeSpace, artifactsSize)
 		// Remove some files to free up space
 		log.Info("Not enough space to download boot artifacts, attempting to remove rhcos by running rpm-ostree cleanup")
 		stdout, stderr, exitCode := util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
 		log.Debugf("Remove RHCOS stdout: %s\nstderr: %s\nexitCode: %d", stdout, stderr, exitCode)
-		freeSpaceAfterCleanup, err := getSize(bootFolder)
+		_, freeSpaceAfterCleanup, err := getSize(bootFolder)
 		if err != nil {
 			log.Warnf("failed to get free space in /host/boot folder: %v", err)
 		}
@@ -125,25 +155,32 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 	if err := createFolders(hostArtifactsFolder, bootLoaderFolder); err != nil {
 		return fmt.Errorf("failed creating folders: %w", err)
 	}
-
-	httpClient, err := createHTTPClient(caCertPath)
-	if err != nil {
-		return fmt.Errorf("failed creating secure assisted service client: %w", err)
+	if err := moveFiles(tempDownloadFolder, hostArtifactsFolder); err != nil {
+		return fmt.Errorf("failed moving files from %s to %s: %w", tempDownloadFolder, hostArtifactsFolder, err)
 	}
-
-	if err := download(httpClient, path.Join(hostArtifactsFolder, kernelFile), *req.KernelURL, retryDownloadAmount); err != nil {
-		return fmt.Errorf("failed downloading kernel to host: %w", err)
-	}
-
-	if err := download(httpClient, path.Join(hostArtifactsFolder, initrdFile), *req.InitrdURL, retryDownloadAmount); err != nil {
-		return fmt.Errorf("failed downloading initrd to host: %w", err)
-	}
-
-	if err := createBootLoaderConfig(*req.RootfsURL, artifactsFolder, bootLoaderFolder); err != nil {
-		return fmt.Errorf("failed creating bootloader config file on host: %w", err)
+	if err := moveFiles(tempBootArtifactsFolder, bootLoaderFolder); err != nil {
+		return fmt.Errorf("failed moving files from %s to %s: %w", tempDownloadFolder, bootLoaderFolder, err)
 	}
 
 	log.Infof("Successfully downloaded boot artifacts and created bootloader config.")
+	return nil
+}
+
+func moveFiles(sourceFolder, destinationFolder string) error {
+	files, err := os.ReadDir(sourceFolder)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %w", sourceFolder, err)
+	}
+	for _, file := range files {
+		if file.IsDir() {
+			log.Infof("Skipping directory %s", file.Name())
+			continue
+		}
+		log.Infof("Moving file %s from %s to %s", file.Name(), sourceFolder, destinationFolder)
+		if err := os.Rename(path.Join(sourceFolder, file.Name()), path.Join(destinationFolder, file.Name())); err != nil {
+			return fmt.Errorf("failed to move file %s to %s: %w", file.Name(), destinationFolder, err)
+		}
+	}
 	return nil
 }
 
@@ -237,13 +274,15 @@ func createFolders(artifactsPath, bootLoaderPath string) error {
 	return nil
 }
 
-func getSize(folder string) (int64, error) {
+// Returns the used space and the available space in the folder
+func getSize(folder string) (int64, int64, error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(folder, &stat); err != nil {
-		return 0, fmt.Errorf("failed to statfs %s: %w", folder, err)
+		return 0, 0, fmt.Errorf("failed to statfs %s: %w", folder, err)
 	}
+	// Used space = (total blocks - free blocks) * block size
 	// Available space = available blocks * block size
-	return int64(stat.Bavail) * int64(stat.Bsize), nil
+	return int64(stat.Blocks-stat.Bfree) * int64(stat.Bsize), int64(stat.Bavail) * int64(stat.Bsize), nil
 }
 
 func removeFiles(folder string) error {
