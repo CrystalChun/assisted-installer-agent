@@ -177,10 +177,50 @@ func moveFiles(sourceFolder, destinationFolder string) error {
 			continue
 		}
 		log.Infof("Moving file %s from %s to %s", file.Name(), sourceFolder, destinationFolder)
-		if err := os.Rename(path.Join(sourceFolder, file.Name()), path.Join(destinationFolder, file.Name())); err != nil {
-			return fmt.Errorf("failed to move file %s to %s: %w", file.Name(), destinationFolder, err)
+		sourcePath := path.Join(sourceFolder, file.Name())
+		destPath := path.Join(destinationFolder, file.Name())
+
+		// Try rename first (fast path for same filesystem)
+		if err := os.Rename(sourcePath, destPath); err != nil {
+			// If rename fails (e.g., cross-device link), copy and delete
+			log.Infof("Rename failed, copying file instead: %v", err)
+			if err := copyFile(sourcePath, destPath); err != nil {
+				return fmt.Errorf("failed to copy file %s to %s: %w", file.Name(), destinationFolder, err)
+			}
+			if err := os.Remove(sourcePath); err != nil {
+				return fmt.Errorf("failed to remove source file %s: %w", sourcePath, err)
+			}
 		}
 	}
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open source file %s: %w", src, err)
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file %s: %w", dst, err)
+	}
+	defer destFile.Close()
+
+	if _, err := io.Copy(destFile, sourceFile); err != nil {
+		return fmt.Errorf("failed to copy data from %s to %s: %w", src, dst, err)
+	}
+
+	// Preserve file permissions
+	sourceInfo, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("failed to stat source file %s: %w", src, err)
+	}
+	if err := os.Chmod(dst, sourceInfo.Mode()); err != nil {
+		return fmt.Errorf("failed to set permissions on %s: %w", dst, err)
+	}
+
 	return nil
 }
 
