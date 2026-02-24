@@ -120,6 +120,49 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 			}
 			log.Infof("Successfully removed rhcos second time")
 		}
+		log.Infof("Chrooting into /host")
+		stdout, stderr, exitCode = util.ExecutePrivileged("chroot", "/host")
+		if exitCode != 0 {
+			log.Errorf("failed to chroot: %s: %s", stdout, stderr)
+		}
+
+		stdout, stderr, exitCode = util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+		if exitCode != 0 {
+			util.ExecuteShell("unset container")
+			stdout, stderr, exitCode = util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+			if exitCode != 0 {
+				log.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
+			}
+			log.Infof("Successfully removed rhcos second time")
+		}
+		info, err := os.Stat(bootFolder)
+		if err != nil {
+			log.Warnf("failed to stat /host/boot folder: %v", err)
+		}
+		log.Infof("boot folder size: %d", info.Size())
+
+		log.Info("trying with regular execute")
+
+		stdout, stderr, exitCode = util.Execute("chroot", "/host")
+		if exitCode != 0 {
+			log.Errorf("failed to chroot: %s: %s", stdout, stderr)
+		}
+
+		stdout, stderr, exitCode = util.Execute("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+		if exitCode != 0 {
+			util.ExecuteShell("unset container")
+			stdout, stderr, exitCode = util.Execute("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+			if exitCode != 0 {
+				log.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
+			}
+			log.Infof("Successfully removed rhcos second time")
+		}
+		info, err = os.Stat(bootFolder)
+		if err != nil {
+			log.Warnf("failed to stat /host/boot folder: %v", err)
+		}
+		log.Infof("boot folder size: %d", info.Size())
+
 		log.Infof("Successfully removed rhcos")
 	}
 
@@ -147,6 +190,8 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 	}
 
 	log.Infof("Successfully downloaded boot artifacts and created bootloader config.")
+	log.Info("Sleeping for 40 minutes for debugging")
+	time.Sleep(40 * time.Minute)
 	return nil
 }
 
