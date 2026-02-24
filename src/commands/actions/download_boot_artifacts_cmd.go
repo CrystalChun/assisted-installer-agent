@@ -78,7 +78,7 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 		return fmt.Errorf("failed remounting /host/boot folder as rw: %w", err)
 	}
 	for i := 0; i < retryCmdAmount; i++ {
-		log.Info("Running download boot artifacts (attempt %d/%d)", i+1, retryCmdAmount)
+		log.Infof("Running download boot artifacts (attempt %d/%d)", i+1, retryCmdAmount)
 		if err := runDownloadBootArtifacts(req, caCertPath, bootFolder); err != nil {
 			log.WithError(err).Errorf("Failed to download boot artifacts (attempt %d/%d), retrying in %s minute", i+1, retryCmdAmount, defaultCmdRetryDelay)
 			time.Sleep(defaultCmdRetryDelay)
@@ -86,9 +86,9 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 		}
 		log.Info("success")
 		i = retryCmdAmount
-		break
+		return nil
 	}
-	return nil
+	return fmt.Errorf("failed to download boot artifacts after %d attempts", retryCmdAmount)
 }
 
 func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPath string, bootFolder string) error {
@@ -102,48 +102,22 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 	if err != nil {
 		return fmt.Errorf("failed to get size of %s to determine free space available for downloading boot artifacts: %w", bootFolder, err)
 	}
-	log.Info("freeSpace: %d", freeSpace)
+	log.Infof("freeSpace: %d", freeSpace)
 	if freeSpace < minFreeSpaceReq {
-
+		log.Infof("freeSpace: %d", freeSpace)
 		// Remove some files to free up space
-		filePath := path.Join(bootFolder, "ostree")
-		log.Infof("Not enough space to download boot artifacts, attempting to remove rhcos %s", filePath)
-		/* 		sysrootFolder := path.Join(*req.HostFsMountDir, "/sysroot")
-		   		if err := syscall.Mount(sysrootFolder, sysrootFolder, "", syscall.MS_REMOUNT, ""); err != nil {
-		   			return fmt.Errorf("failed remounting %s folder as rw: %w", sysrootFolder, err)
-		   		} */
-
+		log.Info("Not enough space to download boot artifacts, attempting to remove rhcos by running rpm-ostree cleanup")
 		stdout, stderr, exitCode := util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-		log.Info("stdout: %s", stdout)
-		log.Info("stderr: %s", stderr)
-		log.Info("exitCode: %d", exitCode)
-
-		/* 		log.Info("trying with regular execute")
-
-		   		stdout, stderr, exitCode = util.Execute("chroot", "/host")
-		   		if exitCode != 0 {
-		   			log.Errorf("failed to chroot: %s: %s", stdout, stderr)
-		   		}
-
-		   		stdout, stderr, exitCode = util.Execute("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-		   		if exitCode != 0 {
-		   			util.ExecuteShell("unset container")
-		   			stdout, stderr, exitCode = util.Execute("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-		   			if exitCode != 0 {
-		   				log.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
-		   			}
-		   			log.Infof("Successfully removed rhcos second time")
-		   		} */
+		log.Debugf("Remove RHCOS stdout: %s\nstderr: %s\nexitCode: %d", stdout, stderr, exitCode)
 		info, err := os.Stat(bootFolder)
 		if err != nil {
 			log.Warnf("failed to stat /host/boot folder: %v", err)
 		}
-		log.Infof("boot folder size: %d", info.Size())
+		log.Infof("boot folder size after removing rhcos: %d", info.Size())
 		if exitCode != 0 {
 			return fmt.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
 		}
-
-		log.Infof("Successfully removed rhcos")
+		log.Info("Successfully removed rhcos")
 	}
 
 	hostArtifactsFolder := path.Join(*req.HostFsMountDir, artifactsFolder)
@@ -170,8 +144,6 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 	}
 
 	log.Infof("Successfully downloaded boot artifacts and created bootloader config.")
-	log.Info("Sleeping for 5 minutes for debugging")
-	time.Sleep(5 * time.Minute)
 	return nil
 }
 
