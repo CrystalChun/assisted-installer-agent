@@ -109,11 +109,11 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 		log.Info("Not enough space to download boot artifacts, attempting to remove rhcos by running rpm-ostree cleanup")
 		stdout, stderr, exitCode := util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
 		log.Debugf("Remove RHCOS stdout: %s\nstderr: %s\nexitCode: %d", stdout, stderr, exitCode)
-		info, err := os.Stat(bootFolder)
+		freeSpaceAfterCleanup, err := getSize(bootFolder)
 		if err != nil {
-			log.Warnf("failed to stat /host/boot folder: %v", err)
+			log.Warnf("failed to get free space in /host/boot folder: %v", err)
 		}
-		log.Infof("boot folder size after removing rhcos: %d", info.Size())
+		log.Infof("free space in boot folder after removing rhcos: %d", freeSpaceAfterCleanup)
 		if exitCode != 0 {
 			return fmt.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
 		}
@@ -193,6 +193,8 @@ func download(httpClient *http.Client, filePath, url string, retry int) error {
 	if err != nil {
 		return fmt.Errorf("failed to read body while getting url %s: %w", url, err)
 	}
+	contentLength := res.Header.Get("Content-Length")
+	log.Infof("Downloaded %s bytes from %s", contentLength, url)
 	err = os.WriteFile(filePath, body, 0644) //nolint:gosec
 	if err != nil {
 		return fmt.Errorf("failed writing file %s: %w", filePath, err)
@@ -236,11 +238,12 @@ func createFolders(artifactsPath, bootLoaderPath string) error {
 }
 
 func getSize(folder string) (int64, error) {
-	info, err := os.Stat(folder)
-	if err != nil {
-		return 0, fmt.Errorf("failed to stat %s: %w", folder, err)
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(folder, &stat); err != nil {
+		return 0, fmt.Errorf("failed to statfs %s: %w", folder, err)
 	}
-	return info.Size(), nil
+	// Available space = available blocks * block size
+	return int64(stat.Bavail) * int64(stat.Bsize), nil
 }
 
 func removeFiles(folder string) error {
