@@ -99,7 +99,9 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 	if err != nil {
 		return fmt.Errorf("failed to get size of %s to determine free space available for downloading boot artifacts: %w", bootFolder, err)
 	}
+	log.Info("freeSpace: %d", freeSpace)
 	if freeSpace < minFreeSpaceReq {
+
 		// Remove some files to free up space
 		filePath := path.Join(bootFolder, "ostree")
 		log.Infof("Not enough space to download boot artifacts, attempting to remove rhcos %s", filePath)
@@ -107,57 +109,29 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 		if err := syscall.Mount(sysrootFolder, sysrootFolder, "", syscall.MS_REMOUNT, ""); err != nil {
 			return fmt.Errorf("failed remounting %s folder as rw: %w", sysrootFolder, err)
 		}
-		stdout, stderr, exitCode := util.Execute("unset container")
-		if exitCode != 0 {
-			log.Errorf("failed to unset container: %s: %s", stdout, stderr)
-		}
-		stdout, stderr, exitCode = util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-		if exitCode != 0 {
-			util.ExecuteShell("unset container")
-			stdout, stderr, exitCode = util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-			if exitCode != 0 {
-				log.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
-			}
-			log.Infof("Successfully removed rhcos second time")
-		}
-		log.Infof("Chrooting into /host")
-		stdout, stderr, exitCode = util.ExecutePrivileged("chroot", "/host")
-		if exitCode != 0 {
-			log.Errorf("failed to chroot: %s: %s", stdout, stderr)
-		}
 
-		stdout, stderr, exitCode = util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-		if exitCode != 0 {
-			util.ExecuteShell("unset container")
-			stdout, stderr, exitCode = util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-			if exitCode != 0 {
-				log.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
-			}
-			log.Infof("Successfully removed rhcos second time")
-		}
+		stdout, stderr, exitCode := util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+		log.Info("stdout: %s", stdout)
+		log.Info("stderr: %s", stderr)
+		log.Info("exitCode: %d", exitCode)
+
+		/* 		log.Info("trying with regular execute")
+
+		   		stdout, stderr, exitCode = util.Execute("chroot", "/host")
+		   		if exitCode != 0 {
+		   			log.Errorf("failed to chroot: %s: %s", stdout, stderr)
+		   		}
+
+		   		stdout, stderr, exitCode = util.Execute("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+		   		if exitCode != 0 {
+		   			util.ExecuteShell("unset container")
+		   			stdout, stderr, exitCode = util.Execute("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+		   			if exitCode != 0 {
+		   				log.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
+		   			}
+		   			log.Infof("Successfully removed rhcos second time")
+		   		} */
 		info, err := os.Stat(bootFolder)
-		if err != nil {
-			log.Warnf("failed to stat /host/boot folder: %v", err)
-		}
-		log.Infof("boot folder size: %d", info.Size())
-
-		log.Info("trying with regular execute")
-
-		stdout, stderr, exitCode = util.Execute("chroot", "/host")
-		if exitCode != 0 {
-			log.Errorf("failed to chroot: %s: %s", stdout, stderr)
-		}
-
-		stdout, stderr, exitCode = util.Execute("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-		if exitCode != 0 {
-			util.ExecuteShell("unset container")
-			stdout, stderr, exitCode = util.Execute("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-			if exitCode != 0 {
-				log.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
-			}
-			log.Infof("Successfully removed rhcos second time")
-		}
-		info, err = os.Stat(bootFolder)
 		if err != nil {
 			log.Warnf("failed to stat /host/boot folder: %v", err)
 		}
@@ -190,8 +164,8 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 	}
 
 	log.Infof("Successfully downloaded boot artifacts and created bootloader config.")
-	log.Info("Sleeping for 40 minutes for debugging")
-	time.Sleep(40 * time.Minute)
+	log.Info("Sleeping for 5 minutes for debugging")
+	time.Sleep(5 * time.Minute)
 	return nil
 }
 
