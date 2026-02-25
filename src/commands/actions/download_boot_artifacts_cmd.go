@@ -77,27 +77,40 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 	if err := syscall.Mount(bootFolder, bootFolder, "", syscall.MS_REMOUNT, ""); err != nil {
 		return fmt.Errorf("failed remounting /host/boot folder as rw: %w", err)
 	}
-	for i := 0; i < retryCmdAmount; i++ {
-		log.Infof("Running download boot artifacts (attempt %d/%d)", i+1, retryCmdAmount)
-		if err := runDownloadBootArtifacts(req, caCertPath, bootFolder); err != nil {
-			log.WithError(err).Errorf("Failed to download boot artifacts (attempt %d/%d), retrying in %s minute", i+1, retryCmdAmount, defaultCmdRetryDelay)
-			time.Sleep(defaultCmdRetryDelay)
-			continue
-		}
-		log.Info("success")
-		i = retryCmdAmount
-		return nil
+	tempBootArtifactsFolder := path.Join("/tmp", "boot_artifacts")
+	log.Info("Running download boot artifacts")
+	if err := runDownloadBootArtifacts(req, caCertPath, bootFolder, tempBootArtifactsFolder); err != nil {
+		log.WithError(err).Error("Failed to download boot artifacts")
+		return err
 	}
-	return fmt.Errorf("failed to download boot artifacts after %d attempts", retryCmdAmount)
+	hasEnoughSpace, err := bootFolderHasEnoughSpace(bootFolder, tempBootArtifactsFolder)
+	if err != nil {
+		log.WithError(err).Error("Failed to check if boot folder has enough space")
+		return err
+	}
+	if hasEnoughSpace {
+		log.Info("Boot folder has enough space, skipping removal of rhcos")
+	} else {
+		if err := removeRhcos(bootFolder); err != nil {
+			log.WithError(err).Error("Failed to remove rhcos")
+			return err
+		}
+	}
+	log.Info("Moving files to boot folder")
+	if err := moveFilesToBootFolder(req, tempBootArtifactsFolder, bootFolder); err != nil {
+		log.WithError(err).Error("Failed to move files to boot folder")
+		return err
+	}
+	log.Info("Successfully downloaded boot artifacts")
+	return nil
 }
 
-func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPath string, bootFolder string) error {
+func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPath string, bootFolder string, tempBootArtifactsFolder string) error {
 	httpClient, err := createHTTPClient(caCertPath)
 	if err != nil {
 		return fmt.Errorf("failed creating secure assisted service client: %w", err)
 	}
 
-	tempBootArtifactsFolder := path.Join("/tmp", "boot_artifacts")
 	if err := createFolderIfNotExist(tempBootArtifactsFolder); err != nil {
 		return fmt.Errorf("failed creating temp download folder: %w", err)
 	}
@@ -116,9 +129,13 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 	if err := createBootLoaderConfig(*req.RootfsURL, artifactsFolder, tempBootArtifactsFolder); err != nil {
 		return fmt.Errorf("failed creating bootloader config file on host: %w", err)
 	}
+	return nil
+}
+
+func bootFolderHasEnoughSpace(bootFolder, tempBootArtifactsFolder string) (bool, error) {
 	artifactsSize, _, err := getSize(tempBootArtifactsFolder)
 	if err != nil {
-		return fmt.Errorf("failed to get size of %s: %w", tempBootArtifactsFolder, err)
+		return false, fmt.Errorf("failed to get size of %s: %w", tempBootArtifactsFolder, err)
 	}
 	log.Infof("size of temp boot artifacts folder: %d", artifactsSize)
 
@@ -130,31 +147,35 @@ func runDownloadBootArtifacts(req models.DownloadBootArtifactsRequest, caCertPat
 	// If there's less than 115MB of space, we call rpm-ostree to cleanup the rhcos image, which takes up a lot of space.
 	_, freeSpace, err := getSize(bootFolder)
 	if err != nil {
-		return fmt.Errorf("failed to get size of %s to determine free space available for downloading boot artifacts: %w", bootFolder, err)
+		return false, fmt.Errorf("failed to get size of %s to determine free space available for downloading boot artifacts: %w", bootFolder, err)
 	}
-	log.Infof("freeSpace: %d", freeSpace)
-	if freeSpace < artifactsSize {
-		log.Infof("freeSpace: %d is less than artifactsSize: %d", freeSpace, artifactsSize)
-		// Remove some files to free up space
-		log.Info("Not enough space to download boot artifacts, attempting to remove rhcos by running rpm-ostree cleanup")
-		stdout, stderr, exitCode := util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
-		log.Debugf("Remove RHCOS stdout: %s\nstderr: %s\nexitCode: %d", stdout, stderr, exitCode)
-		_, freeSpaceAfterCleanup, err := getSize(bootFolder)
-		if err != nil {
-			log.Warnf("failed to get free space in /host/boot folder: %v", err)
-		}
-		log.Infof("free space in boot folder after removing rhcos: %d", freeSpaceAfterCleanup)
-		if exitCode != 0 {
-			return fmt.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
-		}
-		log.Info("Successfully removed rhcos")
-	}
+	return freeSpace >= artifactsSize, nil
+}
 
+func removeRhcos(bootFolder string) error {
+	// Remove some files to free up space
+	log.Info("Not enough space to download boot artifacts, attempting to remove rhcos by running rpm-ostree cleanup")
+	stdout, stderr, exitCode := util.ExecutePrivileged("rpm-ostree", "cleanup", "--os=rhcos", "-r")
+	log.Debugf("Remove RHCOS stdout: %s\nstderr: %s\nexitCode: %d", stdout, stderr, exitCode)
+	_, freeSpaceAfterCleanup, err := getSize(bootFolder)
+	if err != nil {
+		log.Warnf("failed to get free space in /host/boot folder: %v", err)
+	}
+	log.Infof("free space in boot folder after removing rhcos: %d", freeSpaceAfterCleanup)
+	if exitCode != 0 {
+		return fmt.Errorf("failed to remove rhcos: %s: %s", stdout, stderr)
+	}
+	log.Info("Successfully removed rhcos")
+	return nil
+}
+
+func moveFilesToBootFolder(req models.DownloadBootArtifactsRequest, tempBootArtifactsFolder, bootFolder string) error {
 	hostArtifactsFolder := path.Join(*req.HostFsMountDir, artifactsFolder)
 	bootLoaderFolder := path.Join(*req.HostFsMountDir, "/boot/loader/entries")
 	if err := createFolders(hostArtifactsFolder, bootLoaderFolder); err != nil {
 		return fmt.Errorf("failed creating folders: %w", err)
 	}
+	tempDownloadFolder := path.Join(tempBootArtifactsFolder, "download")
 	if err := moveFiles(tempDownloadFolder, hostArtifactsFolder); err != nil {
 		return fmt.Errorf("failed moving files from %s to %s: %w", tempDownloadFolder, hostArtifactsFolder, err)
 	}
@@ -180,17 +201,10 @@ func moveFiles(sourceFolder, destinationFolder string) error {
 		sourcePath := path.Join(sourceFolder, file.Name())
 		destPath := path.Join(destinationFolder, file.Name())
 
-		// Try rename first (fast path for same filesystem)
-		if err := os.Rename(sourcePath, destPath); err != nil {
-			// If rename fails (e.g., cross-device link), copy and delete
-			log.Infof("Rename failed, copying file instead: %v", err)
-			if err := copyFile(sourcePath, destPath); err != nil {
-				return fmt.Errorf("failed to copy file %s to %s: %w", file.Name(), destinationFolder, err)
-			}
-			if err := os.Remove(sourcePath); err != nil {
-				return fmt.Errorf("failed to remove source file %s: %w", sourcePath, err)
-			}
+		if err := copyFile(sourcePath, destPath); err != nil {
+			return fmt.Errorf("failed to copy file %s to %s: %w", file.Name(), destinationFolder, err)
 		}
+
 	}
 	return nil
 }
@@ -314,7 +328,7 @@ func createFolders(artifactsPath, bootLoaderPath string) error {
 	return nil
 }
 
-// Returns the used space and the available space in the folder
+// Returns the used space and the available space of the given folder
 func getSize(folder string) (int64, int64, error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(folder, &stat); err != nil {
@@ -323,20 +337,4 @@ func getSize(folder string) (int64, int64, error) {
 	// Used space = (total blocks - free blocks) * block size
 	// Available space = available blocks * block size
 	return int64(stat.Blocks-stat.Bfree) * int64(stat.Bsize), int64(stat.Bavail) * int64(stat.Bsize), nil
-}
-
-func removeFiles(folder string) error {
-	subFolders, err := os.ReadDir(folder)
-	if err != nil {
-		return fmt.Errorf("failed to read %s: %w", folder, err)
-	}
-	log.Infof("Removing files from %s: %v", folder, subFolders)
-	for _, subFolder := range subFolders {
-		log.Infof("Removing sub folder %s in %s", subFolder.Name(), folder)
-		if err := os.RemoveAll(path.Join(folder, subFolder.Name())); err != nil {
-			return fmt.Errorf("failed to remove sub folder %s in %s: %w", subFolder.Name(), folder, err)
-		}
-	}
-	log.Infof("Successfully removed folders from %s", folder)
-	return nil
 }
