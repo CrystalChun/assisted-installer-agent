@@ -46,13 +46,17 @@ func (a *downloadBootArtifacts) Args() []string {
 	return a.args
 }
 
-type folders struct {
-	// bootFolder is the folder where the /boot directory is mounted
-	bootFolder string
-	// hostArtifactsFolder is the folder where boot artifacts will eventually be moved to in the /boot folder
-	hostArtifactsFolder string
-	// bootLoaderFolder is where the bootloader config is the will eventually exist in the /boot folder
-	bootLoaderFolder string
+// Helper functions to build mounted folder paths from hostFsMountDir
+func getMountedBootFolder(hostFsMountDir string) string {
+	return path.Join(hostFsMountDir, "boot")
+}
+
+func getMountedArtifactsFolder(hostFsMountDir string) string {
+	return path.Join(hostFsMountDir, "boot", artifactsFolder)
+}
+
+func getMountedBootLoaderFolder(hostFsMountDir string) string {
+	return path.Join(hostFsMountDir, "boot", bootLoaderFolder)
 }
 
 const (
@@ -87,8 +91,7 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 		return nil
 	}
 
-	folders, err := createFolders(*req.HostFsMountDir, defaultRetryAmount)
-	if err != nil {
+	if err := createFolders(*req.HostFsMountDir, defaultRetryAmount); err != nil {
 		log.Errorf("failed creating folders: %s", err.Error())
 		return fmt.Errorf("failed creating folders: %s", err.Error())
 	}
@@ -105,12 +108,12 @@ func run(infraEnvId, downloaderRequestStr, caCertPath string) error {
 	}
 	log.Infof("Successfully created bootloader config.")
 
-	if err := ensureBootHasSpace(folders.bootFolder); err != nil {
+	if err := ensureBootHasSpace(getMountedBootFolder(*req.HostFsMountDir)); err != nil {
 		log.Errorf("failed to ensure boot folder has enough space: %s", err.Error())
 		return fmt.Errorf("failed to ensure boot folder has enough space: %s", err.Error())
 	}
 
-	if err := copyFilesToBootFolder(folders); err != nil {
+	if err := copyFilesToBootFolder(*req.HostFsMountDir); err != nil {
 		log.Errorf("failed to move files to boot folder: %s", err.Error())
 		return fmt.Errorf("failed to move files to boot folder: %s", err.Error())
 	}
@@ -229,29 +232,26 @@ func createFolderIfNotExist(folder string) error {
 	return nil
 }
 
-func createFolders(hostFsMountDir string, retryAmount int) (*folders, error) {
+func createFolders(hostFsMountDir string, retryAmount int) error {
 	var err error
-	bootFolder := path.Join(hostFsMountDir, "boot")
-	folders := &folders{
-		bootFolder:          bootFolder,
-		hostArtifactsFolder: path.Join(bootFolder, artifactsFolder),
-		bootLoaderFolder:    path.Join(bootFolder, bootLoaderFolder),
-	}
+	mountedBootFolder := getMountedBootFolder(hostFsMountDir)
+	mountedArtifactsFolder := getMountedArtifactsFolder(hostFsMountDir)
+	mountedBootLoaderFolder := getMountedBootLoaderFolder(hostFsMountDir)
 
 	for i := 0; i < retryAmount; i++ {
 		log.Debugf("Creating folders attempt %d/%d", i, retryAmount)
-		err = syscall.Mount(folders.bootFolder, folders.bootFolder, "", syscall.MS_REMOUNT, "")
+		err = syscall.Mount(mountedBootFolder, mountedBootFolder, "", syscall.MS_REMOUNT, "")
 		if err != nil {
-			log.Warnf("failed to mount boot folder [%s]: %s\nRetrying in %s", folders.bootFolder, err.Error(), defaultRetryDelay)
+			log.Warnf("failed to mount boot folder [%s]: %s\nRetrying in %s", mountedBootFolder, err.Error(), defaultRetryDelay)
 			continue
 		}
 		syscall.Sync()
-		if err = createFolderIfNotExist(folders.hostArtifactsFolder); err != nil {
-			log.Warnf("failed to create artifacts folder [%s]: %s\nRetrying in %s", folders.hostArtifactsFolder, err.Error(), defaultRetryDelay)
+		if err = createFolderIfNotExist(mountedArtifactsFolder); err != nil {
+			log.Warnf("failed to create artifacts folder [%s]: %s\nRetrying in %s", mountedArtifactsFolder, err.Error(), defaultRetryDelay)
 			continue
 		}
-		if err = createFolderIfNotExist(folders.bootLoaderFolder); err != nil {
-			log.Warnf("failed to create bootloader folder [%s]: %s\nRetrying in %s", folders.bootLoaderFolder, err.Error(), defaultRetryDelay)
+		if err = createFolderIfNotExist(mountedBootLoaderFolder); err != nil {
+			log.Warnf("failed to create bootloader folder [%s]: %s\nRetrying in %s", mountedBootLoaderFolder, err.Error(), defaultRetryDelay)
 			continue
 		}
 		if err = createFolderIfNotExist(tempBootArtifactsFolder); err != nil {
@@ -260,9 +260,9 @@ func createFolders(hostFsMountDir string, retryAmount int) (*folders, error) {
 			continue
 		}
 		log.Debug("Folders created successfully")
-		return folders, nil
+		return nil
 	}
-	return nil, fmt.Errorf("failed to create folders: %w", err)
+	return fmt.Errorf("failed to create folders: %w", err)
 }
 
 func ensureBootHasSpace(bootFolder string) error {
@@ -352,15 +352,18 @@ func reclaimBootFolderSpace() error {
 	return nil
 }
 
-func copyFilesToBootFolder(folders *folders) error {
-	if err := copyFile(path.Join(tempBootArtifactsFolder, kernelFile), path.Join(folders.hostArtifactsFolder, kernelFile)); err != nil {
-		return fmt.Errorf("failed to copy file %s to %s: %w", path.Join(tempBootArtifactsFolder, kernelFile), path.Join(folders.hostArtifactsFolder, kernelFile), err)
+func copyFilesToBootFolder(hostFsMountDir string) error {
+	mountedArtifactsFolder := getMountedArtifactsFolder(hostFsMountDir)
+	mountedBootLoaderFolder := getMountedBootLoaderFolder(hostFsMountDir)
+
+	if err := copyFile(path.Join(tempBootArtifactsFolder, kernelFile), path.Join(mountedArtifactsFolder, kernelFile)); err != nil {
+		return fmt.Errorf("failed to copy file %s to %s: %w", path.Join(tempBootArtifactsFolder, kernelFile), path.Join(mountedArtifactsFolder, kernelFile), err)
 	}
-	if err := copyFile(path.Join(tempBootArtifactsFolder, initrdFile), path.Join(folders.hostArtifactsFolder, initrdFile)); err != nil {
-		return fmt.Errorf("failed to copy file %s to %s: %w", path.Join(tempBootArtifactsFolder, initrdFile), path.Join(folders.hostArtifactsFolder, initrdFile), err)
+	if err := copyFile(path.Join(tempBootArtifactsFolder, initrdFile), path.Join(mountedArtifactsFolder, initrdFile)); err != nil {
+		return fmt.Errorf("failed to copy file %s to %s: %w", path.Join(tempBootArtifactsFolder, initrdFile), path.Join(mountedArtifactsFolder, initrdFile), err)
 	}
-	if err := copyFile(path.Join(tempBootArtifactsFolder, bootLoaderConfigFileName), path.Join(folders.bootLoaderFolder, bootLoaderConfigFileName)); err != nil {
-		return fmt.Errorf("failed to copy file %s to %s: %w", path.Join(tempBootArtifactsFolder, bootLoaderConfigFileName), path.Join(folders.bootLoaderFolder, bootLoaderConfigFileName), err)
+	if err := copyFile(path.Join(tempBootArtifactsFolder, bootLoaderConfigFileName), path.Join(mountedBootLoaderFolder, bootLoaderConfigFileName)); err != nil {
+		return fmt.Errorf("failed to copy file %s to %s: %w", path.Join(tempBootArtifactsFolder, bootLoaderConfigFileName), path.Join(mountedBootLoaderFolder, bootLoaderConfigFileName), err)
 	}
 
 	log.Info("Successfully copied files to /boot folder.")
